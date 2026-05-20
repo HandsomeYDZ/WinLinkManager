@@ -1,0 +1,25 @@
+# 忽略编译生成的文件
+bin/
+obj/
+publish/
+logs/
+
+# 忽略IDE和工具临时文件
+.claude/
+.omc/
+.vs/
+.vscode/
+.idea/
+
+# 忽略调试文件
+*.pdb
+*.exe.config
+*.user
+
+# 忽略测试输出
+TestResults/
+coverage/
+
+# 忽略系统文件
+Thumbs.db
+.DS_Store
