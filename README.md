@@ -1,4 +1,4 @@
-# Windows 符号链接管理器 (NTFS Symlink Manager)
+# Windows 链接管理器 (NTFS WinLink Manager)
 
 > **⚠️ 声明：本项目由 AI 全权生成，鄙人不会维护不提供支持。仅供参考。**
 
