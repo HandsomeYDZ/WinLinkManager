@@ -20,7 +20,6 @@
 - C# / .NET 10 / WPF
 - NTFS USN (FSCTL_ENUM_USN_DATA) 直读扫描
 - SQLite 嵌入式数据库
-- 单文件发布（Self-contained，无需安装 .NET 运行时）
 
 ## 使用
 

@@ -1,25 +1,30 @@
-# 忽略编译生成的文件
+# ── .NET 编译生成 ──
 bin/
 obj/
 publish/
-logs/
+*.pdb
+*.user
+*.exe.config
+*.dll
+*.exe
 
-# 忽略IDE和工具临时文件
+# ── 运行时数据 ──
+logs/
+*.db
+*.db-shm
+*.db-wal
+
+# ── IDE / 工具 ──
 .claude/
 .omc/
 .vs/
 .vscode/
 .idea/
 
-# 忽略调试文件
-*.pdb
-*.exe.config
-*.user
-
-# 忽略测试输出
+# ── 测试 ──
 TestResults/
 coverage/
 
-# 忽略系统文件
+# ── 系统 ──
 Thumbs.db
 .DS_Store
