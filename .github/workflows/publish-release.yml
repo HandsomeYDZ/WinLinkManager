@@ -1,77 +1,45 @@
-name: Build Portable Zip
+name: 发布 Release
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version, e.g. v1.0.1 (optional)"
-        required: false
-        default: ""
-      create_release:
-        description: "Create/Update GitHub Release"
-        required: false
-        default: true
-        type: boolean
-  push:
-    tags:
-      - "v*"
+        description: '版本号 (如 v1.0.1)'
+        required: true
+        default: 'v1.0.1'
 
 jobs:
-  build-portable:
+  build-and-release:
     runs-on: windows-latest
     permissions:
       contents: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup .NET SDK
+      - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
 
-      - name: Publish (Portable Multi-file)
+      - name: 发布项目 (框架依赖, 无需运行时)
         run: dotnet publish WinLinkManager.App -c Release -o publish
 
-      - name: Remove Debug Symbols
-        run: |
-          Get-ChildItem publish -File -Filter *.pdb -Recurse -ErrorAction SilentlyContinue | Remove-Item -Force
+      - name: 打包发布文件
+        run: Compress-Archive -Path publish\* -DestinationPath WinLinkManager.zip
 
-      - name: Package Zip
-        id: package
-        run: |
-          $version = "${{ github.ref_name }}"
-          if ([string]::IsNullOrWhiteSpace($version) -or $version -eq "${{ github.event.repository.default_branch }}") {
-            $version = "${{ inputs.version }}"
-          }
-          if ([string]::IsNullOrWhiteSpace($version)) {
-            $version = "manual-${{ github.run_number }}"
-          }
-
-          $zipName = "WinLinkManager-portable-$version.zip"
-          if (Test-Path $zipName) { Remove-Item $zipName -Force }
-          Compress-Archive -Path publish\* -DestinationPath $zipName -Force
-
-          "zip_name=$zipName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-
-      - name: Upload Zip Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.package.outputs.zip_name }}
-          path: ${{ steps.package.outputs.zip_name }}
-
-      - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.create_release == true && inputs.version != '')
+      - name: 上传到 GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.package.outputs.version }}
-          name: WinLinkManager ${{ steps.package.outputs.version }}
+          name: WinLinkManager ${{ github.event.inputs.version }}
+          tag_name: ${{ github.event.inputs.version }}
           body: |
-            Portable build package.
-            - Publish command: `dotnet publish WinLinkManager.App -c Release -o publish`
-            - Run `WinLinkManager.App.exe` as Administrator
-          files: ${{ steps.package.outputs.zip_name }}
+            ## 说明
+            - .NET Framework 4.8 框架
+            - 下载 `WinLinkManager.zip`，解压后右键 `WinLinkManager.App.exe` → 以管理员身份运行
+
+            ## 更新内容
+            - 自动构建，提交: ${{ github.sha }}
+          files: WinLinkManager.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
