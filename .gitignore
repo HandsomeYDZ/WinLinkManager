@@ -20,6 +20,7 @@ logs/
 .vs/
 .vscode/
 .idea/
+.playwright-cli/
 
 # ── 测试 ──
 TestResults/
