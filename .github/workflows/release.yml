@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v1.0.2"
+        required: true
+        default: "v1.0.2"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve release version
+        id: version
+        shell: pwsh
+        run: |
+          $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch") { "${{ inputs.tag }}" } else { "${{ github.ref_name }}" }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "Release tag must look like v1.0.2. Actual: $tag"
+          }
+
+          $version = $tag.Substring(1)
+          "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Restore
+        run: dotnet restore WinLinkManager.sln
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          dotnet publish WinLinkManager.App/WinLinkManager.App.csproj `
+            -c Release `
+            -o artifacts/publish `
+            /p:Version=$env:VERSION `
+            /p:AssemblyVersion="$env:VERSION.0" `
+            /p:FileVersion="$env:VERSION.0" `
+            /p:InformationalVersion=$env:RELEASE_TAG
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts/package | Out-Null
+          $assetPath = "artifacts/package/WinLinkManager-$env:RELEASE_TAG-win-x64.zip"
+          Compress-Archive -Path "artifacts/publish/*" -DestinationPath $assetPath -Force
+          "ASSET_PATH=$assetPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "asset_path=$assetPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinLinkManager-${{ steps.version.outputs.tag }}-win-x64
+          path: ${{ steps.package.outputs.asset_path }}
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release create "$env:RELEASE_TAG" "$env:ASSET_PATH" `
+            --title "WinLinkManager $env:RELEASE_TAG" `
+            --generate-notes `
+            --target "${{ github.sha }}"

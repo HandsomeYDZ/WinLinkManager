@@ -14,6 +14,7 @@ public class LinkService : ILinkService
 {
     // Win32 常量定义
     private const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x400;
+    private const uint FILE_ATTRIBUTE_DIRECTORY = 0x10;
     private const uint INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF;
     private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
     private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
@@ -21,7 +22,6 @@ public class LinkService : ILinkService
     private const uint FSCTL_SET_REPARSE_POINT = 0x000900A4;
     private const uint IO_REPARSE_TAG_SYMLINK = 0xA000000C;
     private const uint IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003;
-    private const uint SYMLINK_FLAG_DIRECTORY = 0x00000001;
 
     // SYMBOLIC_LINK_FLAG values for CreateSymbolicLinkW
     private const int SYMLINK_FLAG_FILE = 0;
@@ -56,6 +56,21 @@ public class LinkService : ILinkService
         out uint lpBytesReturned,
         IntPtr lpOverlapped);
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileAttributeTagInfo
+    {
+        public uint FileAttributes;
+        public uint ReparseTag;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetFileInformationByHandleEx(
+        SafeFileHandle hFile,
+        int fileInformationClass,
+        out FileAttributeTagInfo lpFileInformation,
+        uint dwBufferSize);
+
     [DllImport("kernel32.dll")]
     private static extern uint GetLastError();
 
@@ -63,8 +78,10 @@ public class LinkService : ILinkService
     private const uint GENERIC_WRITE = 0x40000000;
     private const uint FILE_SHARE_READ = 0x00000001;
     private const uint FILE_SHARE_WRITE = 0x00000002;
+    private const uint FILE_SHARE_DELETE = 0x00000004;
     private const uint OPEN_EXISTING = 3;
     private const uint FILE_ATTRIBUTE_NORMAL = 0x80;
+    private const int FILE_ATTRIBUTE_TAG_INFO_CLASS = 9;
 
     private readonly IIndexService _indexService;
     private readonly ILogger<LinkService>? _logger; // 为 null 时跳过日志记录
@@ -216,6 +233,27 @@ public class LinkService : ILinkService
             };
         }
 
+        // 创建 API 返回成功后仍从重解析点回读，只有磁盘上的真实类型吻合才算成功。
+        var actualType = DetectType(linkPath);
+        if (actualType != newType)
+        {
+            try
+            {
+                DeleteLink(linkPath, actualType);
+                Directory.Move(backupPath, linkPath);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "类型校验失败且恢复备份失败: {LinkPath}", linkPath);
+            }
+
+            return new ConvertResult
+            {
+                Success = false,
+                ErrorMessage = $"类型校验失败：请求 {newType}，实际 {actualType}"
+            };
+        }
+
         // Step 5: 删除备份（尽力而为）
         try
         {
@@ -232,20 +270,13 @@ public class LinkService : ILinkService
     /// <summary>检测路径上的链接类型，通过读取重解析点标识判断</summary>
     public LinkType DetectType(string linkPath)
     {
-        if (!Exists(linkPath))
-            return LinkType.FileLink;
-
         var attrs = GetFileAttributesW(linkPath);
-        if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_REPARSE_POINT) == 0)
-        {
-            return Directory.Exists(linkPath) ? LinkType.DirectoryLink : LinkType.FileLink;
-        }
 
-        // Read reparse point data via DeviceIoControl
+        // 直接打开重解析点本身，因此即使目标已失效也仍能读取真实类型。
         using var handle = CreateFileW(
             linkPath,
-            GENERIC_READ,
-            FILE_SHARE_READ,
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             IntPtr.Zero,
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -254,6 +285,24 @@ public class LinkService : ILinkService
         if (handle.IsInvalid)
             return Directory.Exists(linkPath) ? LinkType.DirectoryLink : LinkType.FileLink;
 
+        if (GetFileInformationByHandleEx(handle, FILE_ATTRIBUTE_TAG_INFO_CLASS,
+                out var tagInfo, (uint)Marshal.SizeOf<FileAttributeTagInfo>()))
+        {
+            attrs = tagInfo.FileAttributes;
+            if (tagInfo.ReparseTag == IO_REPARSE_TAG_MOUNT_POINT)
+                return LinkType.Junction;
+            if (tagInfo.ReparseTag == IO_REPARSE_TAG_SYMLINK)
+                return (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0
+                    ? LinkType.DirectoryLink
+                    : LinkType.FileLink;
+        }
+
+        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT) == 0)
+            return (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0
+                ? LinkType.DirectoryLink
+                : LinkType.FileLink;
+
+        // 兼容回退：读取完整重解析缓冲区中的 Tag。
         const int bufferSize = 16384;
         var buffer = Marshal.AllocHGlobal(bufferSize);
         try
@@ -267,13 +316,10 @@ public class LinkService : ILinkService
                     return LinkType.Junction;
 
                 if (tag == IO_REPARSE_TAG_SYMLINK)
-                {
-                    // SymbolicLinkReparseBuffer.Flags is at offset 16
-                    var flags = Marshal.ReadInt32(buffer, 16);
-                    if ((flags & SYMLINK_FLAG_DIRECTORY) != 0)
-                        return LinkType.DirectoryLink;
-                    return LinkType.FileLink;
-                }
+                    return (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) ||
+                           Directory.Exists(linkPath)
+                        ? LinkType.DirectoryLink
+                        : LinkType.FileLink;
             }
         }
         finally
@@ -287,23 +333,20 @@ public class LinkService : ILinkService
     /// <summary>检查路径是否存在</summary>
     public bool Exists(string linkPath) => File.Exists(linkPath) || Directory.Exists(linkPath);
 
-    /// <summary>创建交接点（优先尝试目录符号链接，失败则通过 DeviceIoControl 创建）</summary>
+    /// <summary>通过 MOUNT_POINT 重解析点创建真正的交接点。</summary>
     private bool CreateJunction(string linkPath, string targetPath)
     {
-        // 优先使用目录符号链接（Win10+ 开发者模式下可用）
-        if (CreateSymbolicLinkW(linkPath, targetPath, SYMLINK_FLAG_DIR))
-            return true;
-
-        // 回退: 通过 DeviceIoControl 创建交接点
         try
         {
+            targetPath = GetAbsoluteTargetPath(linkPath, targetPath);
+
             if (!Directory.Exists(linkPath))
                 Directory.CreateDirectory(linkPath);
 
             using var handle = CreateFileW(
                 linkPath,
                 GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 IntPtr.Zero,
                 OPEN_EXISTING,
                 FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -316,35 +359,40 @@ public class LinkService : ILinkService
             }
 
             // 准备 MOUNT_POINT_REPARSE_DATA_BUFFER
-            var substituteName = @"\??\" + targetPath;
+            var substituteName = targetPath.StartsWith(@"\\", StringComparison.Ordinal)
+                ? @"\??\UNC\" + targetPath.TrimStart('\\')
+                : @"\??\" + targetPath;
             var substituteBytes = Encoding.Unicode.GetBytes(substituteName);
             var printNameBytes = Encoding.Unicode.GetBytes(targetPath);
 
             ushort substituteNameOffset = 0;
             ushort substituteNameLength = (ushort)substituteBytes.Length;
-            ushort printNameOffset = substituteNameLength;
+            ushort printNameOffset = (ushort)(substituteNameLength + sizeof(char));
             ushort printNameLength = (ushort)printNameBytes.Length;
 
             // ReparseTag(4) + ReparseDataLength(2) + Reserved(2) +
             // SubstituteNameOffset(2) + SubstituteNameLength(2) +
             // PrintNameOffset(2) + PrintNameLength(2) = 16 bytes header
-            var reparseDataLength = substituteNameLength + printNameLength + 12;
+            var pathBufferLength = substituteNameLength + sizeof(char) + printNameLength + sizeof(char);
+            var reparseDataLength = pathBufferLength + 8;
             var totalSize = reparseDataLength + 8;
             var buf = Marshal.AllocHGlobal(totalSize);
 
             try
             {
+                var pathOffset = 16;
+                // 两个名称都以 NUL 分隔/结尾；Length 字段本身不包含 NUL。
+                for (var i = 0; i < totalSize; i++)
+                    Marshal.WriteByte(buf, i, 0);
                 Marshal.WriteInt32(buf, 0, unchecked((int)IO_REPARSE_TAG_MOUNT_POINT));
                 Marshal.WriteInt16(buf, 4, (short)reparseDataLength);
-                Marshal.WriteInt16(buf, 6, 0); // Reserved
+                Marshal.WriteInt16(buf, 6, 0);
                 Marshal.WriteInt16(buf, 8, (short)substituteNameOffset);
                 Marshal.WriteInt16(buf, 10, (short)substituteNameLength);
                 Marshal.WriteInt16(buf, 12, (short)printNameOffset);
                 Marshal.WriteInt16(buf, 14, (short)printNameLength);
-
-                var pathOffset = 16;
                 Marshal.Copy(substituteBytes, 0, buf + pathOffset, substituteBytes.Length);
-                Marshal.Copy(printNameBytes, 0, buf + pathOffset + substituteNameLength, printNameBytes.Length);
+                Marshal.Copy(printNameBytes, 0, buf + pathOffset + printNameOffset, printNameBytes.Length);
 
                 var success = DeviceIoControl(handle, FSCTL_SET_REPARSE_POINT,
                     buf, (uint)totalSize, IntPtr.Zero, 0, out _, IntPtr.Zero);
@@ -367,5 +415,29 @@ public class LinkService : ILinkService
             try { Directory.Delete(linkPath); } catch { }
             return false;
         }
+    }
+
+    /// <summary>交接点必须保存绝对目标；相对输入按链接所在目录解析。</summary>
+    private static string GetAbsoluteTargetPath(string linkPath, string targetPath)
+    {
+        string fullPath;
+        if (Path.IsPathRooted(targetPath))
+        {
+            fullPath = Path.GetFullPath(targetPath);
+        }
+        else
+        {
+            var linkDirectory = Path.GetDirectoryName(Path.GetFullPath(linkPath));
+            if (string.IsNullOrEmpty(linkDirectory))
+                throw new ArgumentException("无法确定链接所在目录", nameof(linkPath));
+
+            fullPath = Path.GetFullPath(Path.Combine(linkDirectory, targetPath));
+        }
+
+        if (fullPath.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase))
+            return @"\\" + fullPath.Substring(8);
+        if (fullPath.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase))
+            return fullPath.Substring(4);
+        return fullPath;
     }
 }

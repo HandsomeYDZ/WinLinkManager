@@ -19,8 +19,13 @@ public class UsnMonitorService : IUsnMonitorService, IDisposable
     private long _lastUsn;        // 上次读取的 USN 序号
     private long _usnJournalId;   // 当前卷的 USN 日志 ID
     private bool _usnReady;       // USN journal 是否已就绪
-    private ConcurrentDictionary<string, byte> _pendingChanges = new(); // 去重收集的待处理变更
+    private ConcurrentDictionary<string, byte> _pendingChanges =
+        new(StringComparer.OrdinalIgnoreCase); // 去重收集的待处理变更
+    private readonly ConcurrentDictionary<string, byte> _knownLinkPaths =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _debounceLock = new();
     private const int DebounceMs = 500;  // 变更事件防抖间隔
+    private const int IdleBackoffMs = 250; // 防御性退避：即使驱动立即返回也不会空转
 
     /// <summary>文件系统变更事件</summary>
     public event EventHandler<FsChangeEventArgs>? ChangeDetected;
@@ -47,7 +52,15 @@ public class UsnMonitorService : IUsnMonitorService, IDisposable
 
         var scanDirs = await _indexService.GetScanDirectoriesAsync();
         var activePaths = scanDirs.Where(d => !d.IsExcluded && Directory.Exists(d.Path)).Select(d => d.Path).ToList();
-        if (activePaths.Count == 0) { _logger.LogWarning("没有有效的扫描目录，跳过文件监控"); return; }
+        if (activePaths.Count == 0)
+        {
+            _logger.LogWarning("没有有效的扫描目录，跳过文件监控");
+            IsRunning = false;
+            return;
+        }
+
+        foreach (var entry in await _indexService.GetAllAsync())
+            _knownLinkPaths[entry.LinkPath] = 0;
 
         try
         {
@@ -55,10 +68,10 @@ public class UsnMonitorService : IUsnMonitorService, IDisposable
             {
                 _logger.LogInformation("USN journal 可用，启动 USN 轮询监控");
                 _monitorTask = Task.Factory.StartNew(
-                    () => UsnPollingLoopAsync(_cts.Token),
+                    () => UsnPollingLoop(_cts.Token),
                     _cts.Token,
                     TaskCreationOptions.LongRunning,
-                    TaskScheduler.Default).Unwrap();
+                    TaskScheduler.Default);
             }
             else throw new InvalidOperationException("USN journal 不可用");
         }
@@ -109,7 +122,7 @@ public class UsnMonitorService : IUsnMonitorService, IDisposable
     }
 
     /// <summary>USN 轮询主循环：阻塞式读取 USN journal 的变更记录</summary>
-    private async Task UsnPollingLoopAsync(CancellationToken ct)
+    private void UsnPollingLoop(CancellationToken ct)
     {
         _logger.LogInformation("USN 阻塞监听已启动 (NextUsn={LastUsn})", _lastUsn);
 
@@ -122,92 +135,128 @@ public class UsnMonitorService : IUsnMonitorService, IDisposable
             return;
         }
 
-        while (!ct.IsCancellationRequested)
+        using var cancellationRegistration = ct.Register(() =>
         {
-            if (!_usnReady) { await Task.Delay(1000, ct); continue; }
+            if (!volumeHandle.IsInvalid)
+                NtfsNative.CancelIoEx(volumeHandle, IntPtr.Zero);
+        });
 
-            try
+        var inputBuffer = Marshal.AllocHGlobal(40);
+        var outputBuffer = Marshal.AllocHGlobal(65536);
+        try
+        {
+            while (!ct.IsCancellationRequested)
             {
-                if (CheckUsnJournalBlocking(volumeHandle, ct))
-                    FireEvent(FsChangeType.Modified, "");
+                if (!_usnReady)
+                {
+                    if (ct.WaitHandle.WaitOne(1000)) break;
+                    continue;
+                }
+
+                var result = CheckUsnJournalBlocking(volumeHandle, inputBuffer, outputBuffer);
+                if (result == UsnReadResult.ReparseChanged)
+                    FireEvent(FsChangeType.Modified, string.Empty);
+                else if (result == UsnReadResult.Retry)
+                {
+                    if (ct.WaitHandle.WaitOne(1000)) break;
+                }
+                else
+                {
+                    if (ct.WaitHandle.WaitOne(IdleBackoffMs)) break;
+                }
             }
-            catch (OperationCanceledException) { break; }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "USN 读取异常，停止 USN 监控");
-                break;
-            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "USN 读取异常，停止 USN 监控");
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(inputBuffer);
+            Marshal.FreeHGlobal(outputBuffer);
         }
     }
 
     /// <summary>
-    /// 阻塞式 USN 读取。DeviceIoControl 在内核态等待直到有数据或超时，
-    /// 期间线程挂起，CPU 占用为 0。只读一次记录后立即返回。
+    /// 阻塞式 USN 读取。BytesToWaitFor 非零时 DeviceIoControl 才会在
+    /// 内核态等待；取消应用令牌时通过 CancelIoEx 唤醒同步 I/O。
     /// </summary>
-    private bool CheckUsnJournalBlocking(SafeFileHandle volumeHandle, CancellationToken ct)
+    private enum UsnReadResult
     {
-        // 构造 READ_USN_JOURNAL_DATA_V0 输入结构（40 字节）
-        var inputBuf = Marshal.AllocHGlobal(40);
-        try
-        {
-            Marshal.WriteInt64(inputBuf, 0, _lastUsn + 1);     // StartUsn: 从此序号后开始读取
-            Marshal.WriteInt32(inputBuf, 8, unchecked((int)0xFFFFFFFF));  // ReasonMask: 监听所有变更原因
-            Marshal.WriteInt32(inputBuf, 12, 1);                // ReturnOnlyOnClose: 只返回关闭时的记录
-            Marshal.WriteInt64(inputBuf, 16, 2L);               // Timeout: 2 秒内核等待
-            Marshal.WriteInt64(inputBuf, 24, 0L);               // BytesToWaitFor: 0（有数据即返回）
-            Marshal.WriteInt64(inputBuf, 32, _usnJournalId);    // UsnJournalID
-        }
-        catch { Marshal.FreeHGlobal(inputBuf); return false; }
+        NoChanges,
+        ReparseChanged,
+        Retry
+    }
 
-        var outputBuf = Marshal.AllocHGlobal(65536);
-        var foundReparse = false;
+    private UsnReadResult CheckUsnJournalBlocking(
+        SafeFileHandle volumeHandle,
+        IntPtr inputBuf,
+        IntPtr outputBuf)
+    {
+        const int inputSize = 40;
+        const int outputSize = 65536;
+
+        var reasonMask = NtfsNative.USN_REASON_FILE_CREATE |
+                         NtfsNative.USN_REASON_FILE_DELETE |
+                         NtfsNative.USN_REASON_RENAME_OLD_NAME |
+                         NtfsNative.USN_REASON_RENAME_NEW_NAME |
+                         NtfsNative.USN_REASON_REPARSE_POINT_CHANGE;
+
+        Marshal.WriteInt64(inputBuf, 0, _lastUsn);               // StartUsn
+        Marshal.WriteInt32(inputBuf, 8, unchecked((int)reasonMask));
+        Marshal.WriteInt32(inputBuf, 12, 0);                     // ReturnOnlyOnClose
+        Marshal.WriteInt64(inputBuf, 16, 1L);                    // Timeout（秒）
+        Marshal.WriteInt64(inputBuf, 24, 1L);                    // 非零才会阻塞等待
+        Marshal.WriteInt64(inputBuf, 32, _usnJournalId);
 
         try
         {
             if (!NtfsNative.DeviceIoControl(volumeHandle, NtfsNative.FSCTL_READ_USN_JOURNAL,
-                    inputBuf, 40, outputBuf, 65536, out var bytesReturned, IntPtr.Zero))
+                    inputBuf, inputSize, outputBuf, outputSize, out var bytesReturned, IntPtr.Zero))
             {
                 var error = Marshal.GetLastWin32Error();
-                // ERROR_HANDLE_EOF (38) = 超时无数据（正常），返回 false
-                if (error == 38) return false;
+                // ERROR_HANDLE_EOF / ERROR_OPERATION_ABORTED 是正常的无数据或退出路径。
+                if (error is 38 or 995) return UsnReadResult.NoChanges;
                 _logger.LogWarning("FSCTL_READ_USN_JOURNAL 失败: error={Error}", error);
-                return false;
+                return UsnReadResult.Retry;
             }
 
-            if (bytesReturned < 8) return false;
+            if (bytesReturned < sizeof(long)) return UsnReadResult.Retry;
 
-            // 遍历记录，查找重解析点变更（排除 CLOSE 事件以避免重复）
-            var recordEnd = bytesReturned - 8L; // 最后 8 字节是 NextUsn
-            var offset = 0u;
+            // READ_USN_JOURNAL 输出的前 8 字节才是下一次读取的 StartUsn。
+            _lastUsn = Marshal.ReadInt64(outputBuf, 0);
+            var foundReparse = false;
+            var offset = sizeof(long);
 
-            while (offset + 60 <= recordEnd)
+            while (offset + 8 <= bytesReturned)
             {
-                var recordLen = Marshal.ReadInt32(outputBuf, (int)offset);
-                if (recordLen <= 0 || offset + (uint)recordLen > recordEnd) break;
+                var recordLen = Marshal.ReadInt32(outputBuf, offset);
+                if (recordLen <= 0 || offset + recordLen > bytesReturned) break;
 
-                var attrs = Marshal.ReadInt32(outputBuf, (int)offset + 32);
-                var reason = Marshal.ReadInt32(outputBuf, (int)offset + 24);
+                var majorVersion = Marshal.ReadInt16(outputBuf, offset + 4);
+                var reasonOffset = majorVersion == 3 ? 56 : 40;
+                var attributesOffset = majorVersion == 3 ? 68 : 52;
+                var minimumLength = majorVersion == 3 ? 76 : 60;
 
-                // 只关注重解析点（符号链接/交接点）的非关闭事件
-                if ((attrs & (int)NtfsNative.FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+                if (recordLen >= minimumLength)
                 {
-                    if (reason != unchecked((int)NtfsNative.USN_REASON_CLOSE))
+                    var reason = unchecked((uint)Marshal.ReadInt32(outputBuf, offset + reasonOffset));
+                    var attrs = unchecked((uint)Marshal.ReadInt32(outputBuf, offset + attributesOffset));
+                    if ((reason & reasonMask) != 0 &&
+                        (attrs & NtfsNative.FILE_ATTRIBUTE_REPARSE_POINT) != 0)
                         foundReparse = true;
                 }
 
-                offset += (uint)recordLen;
+                offset += recordLen;
             }
 
-            // 更新 LastUsn 为下一轮起始位置
-            _lastUsn = Marshal.ReadInt64(outputBuf, (int)recordEnd);
+            return foundReparse ? UsnReadResult.ReparseChanged : UsnReadResult.NoChanges;
         }
-        finally
+        catch (Exception ex)
         {
-            Marshal.FreeHGlobal(inputBuf);
-            Marshal.FreeHGlobal(outputBuf);
+            _logger.LogWarning(ex, "解析 USN 记录失败");
+            return UsnReadResult.Retry;
         }
-
-        return foundReparse;
     }
 
     /// <summary>在指定路径上启动 FileSystemWatcher 作为辅助监控</summary>
@@ -239,8 +288,22 @@ public class UsnMonitorService : IUsnMonitorService, IDisposable
     private void OnWatcherEvent(object sender, FileSystemEventArgs e)
     {
         bool isReparse;
-        try { var attr = File.GetAttributes(e.FullPath); isReparse = attr.HasFlag(FileAttributes.ReparsePoint); }
-        catch { isReparse = e.ChangeType == WatcherChangeTypes.Deleted; }
+        if (e.ChangeType == WatcherChangeTypes.Deleted)
+        {
+            // 删除后无法再读取属性，只处理索引中已知的链接，避免每个普通文件删除都触发刷新。
+            isReparse = _knownLinkPaths.TryRemove(e.FullPath, out _);
+        }
+        else
+        {
+            try
+            {
+                var attr = File.GetAttributes(e.FullPath);
+                isReparse = attr.HasFlag(FileAttributes.ReparsePoint);
+                if (isReparse) _knownLinkPaths[e.FullPath] = 0;
+            }
+            catch { isReparse = false; }
+        }
+
         if (!isReparse) return;
         var type = e.ChangeType switch
         {
@@ -255,10 +318,12 @@ public class UsnMonitorService : IUsnMonitorService, IDisposable
     /// <summary>FSW 重命名事件：同时记录新旧路径</summary>
     private void OnWatcherRenamed(object sender, RenamedEventArgs e)
     {
+        var wasKnownLink = _knownLinkPaths.TryRemove(e.OldFullPath, out _);
         bool isReparse;
         try { var attr = File.GetAttributes(e.FullPath); isReparse = attr.HasFlag(FileAttributes.ReparsePoint); }
         catch { isReparse = false; }
-        if (!isReparse) return;
+        if (!isReparse && !wasKnownLink) return;
+        if (isReparse) _knownLinkPaths[e.FullPath] = 0;
         _pendingChanges[e.FullPath] = 1;
         _pendingChanges[e.OldFullPath] = 1;
         DebounceFire(FsChangeType.Modified, e.FullPath);
@@ -274,17 +339,20 @@ public class UsnMonitorService : IUsnMonitorService, IDisposable
     private CancellationTokenSource? _debounceCts;
     private void DebounceFire(FsChangeType type, string path)
     {
-        lock (this)
+        lock (_debounceLock)
         {
-            _debounceCts?.Cancel();
+            var previous = _debounceCts;
+            previous?.Cancel();
             _debounceCts = new CancellationTokenSource();
+            previous?.Dispose();
             var token = _debounceCts.Token;
             _ = Task.Run(async () =>
             {
                 try
                 {
                     await Task.Delay(DebounceMs, token);
-                    var snapshot = Interlocked.Exchange(ref _pendingChanges, new ConcurrentDictionary<string, byte>());
+                    var snapshot = Interlocked.Exchange(ref _pendingChanges,
+                        new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase));
                     if (snapshot.Count > 0)
                         FireEvent(type, path, snapshot.Keys.ToList());
                 }
@@ -314,6 +382,11 @@ public class UsnMonitorService : IUsnMonitorService, IDisposable
         foreach (var fsw in _watchers) { fsw.EnableRaisingEvents = false; fsw.Dispose(); }
         _watchers.Clear();
         _cts?.Cancel(); _cts?.Dispose();
-        _debounceCts?.Dispose();
+        lock (_debounceLock)
+        {
+            _debounceCts?.Cancel();
+            _debounceCts?.Dispose();
+            _debounceCts = null;
+        }
     }
 }

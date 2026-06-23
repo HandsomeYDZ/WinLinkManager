@@ -47,7 +47,9 @@ public class CreateLinkViewModel : ViewModelBase
         set => SetProperty(ref _targetPath, value);
     }
 
-    private LinkType _linkType;
+    // 新建目录链接时默认使用真正的 NTFS 交接点，而不是文件符号链接。
+    // 编辑模式会在构造函数中覆盖为原条目的实际类型。
+    private LinkType _linkType = LinkType.Junction;
     public LinkType LinkType
     {
         get => _linkType;
@@ -137,6 +139,12 @@ public class CreateLinkViewModel : ViewModelBase
             return false;
         }
 
+        if (!EnsureCreatedType())
+        {
+            _linkService.DeleteLink(LinkPath, _linkService.DetectType(LinkPath));
+            return false;
+        }
+
         CreateEntry();
         _ = _indexService.UpsertAsync(CreatedEntry!);
         return true;
@@ -160,6 +168,13 @@ public class CreateLinkViewModel : ViewModelBase
                 ErrorMessage = "更新链接失败，请确认是否有管理员权限";
                 return false;
             }
+
+            if (!EnsureCreatedType())
+            {
+                _linkService.DeleteLink(LinkPath, _linkService.DetectType(LinkPath));
+                _linkService.CreateLink(originalPath, _originalEntry.TargetPath, originalType);
+                return false;
+            }
         }
         else
         {
@@ -173,6 +188,12 @@ public class CreateLinkViewModel : ViewModelBase
             if (!_linkService.CreateLink(LinkPath, TargetPath, LinkType))
             {
                 ErrorMessage = "创建新链接失败，请确认是否有管理员权限";
+                return false;
+            }
+
+            if (!EnsureCreatedType())
+            {
+                _linkService.DeleteLink(LinkPath, _linkService.DetectType(LinkPath));
                 return false;
             }
 
@@ -191,20 +212,46 @@ public class CreateLinkViewModel : ViewModelBase
         return true;
     }
 
+    /// <summary>创建后从磁盘回读类型，防止界面/数据库类型与重解析点不一致。</summary>
+    private bool EnsureCreatedType()
+    {
+        var actualType = _linkService.DetectType(LinkPath);
+        if (actualType == LinkType)
+            return true;
+
+        ErrorMessage = $"链接类型创建不一致：请求 {LinkType}，实际 {actualType}";
+        return false;
+    }
+
     /// <summary> 根据当前输入构造 LinkEntry 对象，编辑模式下保留原有白名单状态。 </summary>
     private void CreateEntry()
     {
         var now = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+        var indexedTargetPath = GetIndexedTargetPath();
         CreatedEntry = new LinkEntry
         {
             LinkPath = LinkPath,
             LinkName = Path.GetFileName(LinkPath),
-            TargetPath = TargetPath,
+            TargetPath = indexedTargetPath,
             LinkType = LinkType,
             CreationTime = _originalEntry?.CreationTime ?? now,
-            Status = LinkStatus.Valid,
+            Status = Directory.Exists(indexedTargetPath) || File.Exists(indexedTargetPath)
+                ? LinkStatus.Valid
+                : LinkStatus.Broken,
             InWhitelist = _originalEntry?.InWhitelist ?? false,
             LastSeenTime = now
         };
+    }
+
+    /// <summary>索引使用完整目标路径，避免相对路径依赖应用当前工作目录。</summary>
+    private string GetIndexedTargetPath()
+    {
+        if (Path.IsPathRooted(TargetPath))
+            return Path.GetFullPath(TargetPath);
+
+        var linkDirectory = Path.GetDirectoryName(Path.GetFullPath(LinkPath));
+        return string.IsNullOrEmpty(linkDirectory)
+            ? TargetPath
+            : Path.GetFullPath(Path.Combine(linkDirectory, TargetPath));
     }
 }

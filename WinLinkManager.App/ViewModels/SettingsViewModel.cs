@@ -179,7 +179,7 @@ public class SettingsViewModel : ViewModelBase
             Process.Start("explorer.exe", path);
     }
 
-    public string AppVersion => "WinLink Manager v1.0.0";
+    public string AppVersion => "WinLink Manager v1.0.2";
     public string Description => "Windows 符号链接管理器 — 扫描、管理、监控文件系统中的符号链接和交接点。";
 }
 

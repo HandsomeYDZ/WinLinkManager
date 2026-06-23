@@ -8,17 +8,21 @@ public static class NtfsNative
     public const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x400;
     public const uint IO_REPARSE_TAG_SYMLINK = 0xA000000C;
     public const uint IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003;
-    public const uint SYMLINK_FLAG_DIRECTORY = 0x1;
-    public const uint SYMLINK_FLAG_RELATIVE = 0x2;
+    // SymbolicLinkReparseBuffer.Flags uses bit 0 to indicate a relative target.
+    // This is different from CreateSymbolicLinkW's dwFlags, where bit 0 means
+    // that the link itself points to a directory.
+    public const uint SYMLINK_FLAG_RELATIVE = 0x1;
 
     public const uint FSCTL_ENUM_USN_DATA = 0x000900B3;
     public const uint FSCTL_READ_USN_JOURNAL = 0x000900BB;
     public const uint FSCTL_GET_REPARSE_POINT = 0x000900A8;
     public const uint FSCTL_QUERY_USN_JOURNAL = 0x000900F4;
 
-    public const uint USN_REASON_FILE_DELETE = 0x80000000;
+    public const uint USN_REASON_FILE_DELETE = 0x00000200;
     public const uint USN_REASON_FILE_CREATE = 0x00000100;
+    public const uint USN_REASON_RENAME_OLD_NAME = 0x00001000;
     public const uint USN_REASON_RENAME_NEW_NAME = 0x00002000;
+    public const uint USN_REASON_REPARSE_POINT_CHANGE = 0x00100000;
     public const uint USN_REASON_DATA_OVERWRITE = 0x00000001;
     public const uint USN_REASON_CLOSE = 0x80000000;
 
@@ -74,6 +78,9 @@ public static class NtfsNative
         nint lpInBuffer, uint nInBufferSize,
         nint lpOutBuffer, uint nOutBufferSize,
         out uint lpBytesReturned, nint lpOverlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CancelIoEx(SafeFileHandle hFile, nint lpOverlapped);
 
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     public static extern uint GetFinalPathNameByHandle(
@@ -137,8 +144,12 @@ public static class NtfsNative
 
     public static string NtToWin32Path(string ntPath)
     {
+        if (ntPath.StartsWith(@"\??\UNC\", StringComparison.OrdinalIgnoreCase))
+            return @"\\" + ntPath.Substring(8);
         if (ntPath.StartsWith(@"\??\"))
             return ntPath.Substring(4);
+        if (ntPath.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase))
+            return @"\\" + ntPath.Substring(8);
         if (ntPath.StartsWith(@"\\?\"))
             return ntPath.Substring(4);
         if (ntPath.StartsWith(@"\Device\HarddiskVolume"))

@@ -11,6 +11,10 @@
     <LangVersion>12</LangVersion>
     <SatelliteResourceLanguages>en-US;zh-CN</SatelliteResourceLanguages>
     <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <Version>1.0.2</Version>
+    <AssemblyVersion>1.0.2.0</AssemblyVersion>
+    <FileVersion>1.0.2.0</FileVersion>
+    <InformationalVersion>v1.0.2</InformationalVersion>
   </PropertyGroup>
 
   <ItemGroup>

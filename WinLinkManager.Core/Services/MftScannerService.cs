@@ -29,6 +29,9 @@ public class MftScannerService : IScannerService
         IProgress<ScanProgress>? progress,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
     {
+        // 扫描由调用方安排在后台线程；先异步让步，避免同步完成的“假异步”迭代器。
+        await Task.Yield();
+
         // 构建排除路径集合和包含路径列表
         var excluded = scanDirs
             .Where(d => d.IsExcluded)
@@ -465,8 +468,11 @@ public class MftScannerService : IScannerService
                 return null; // 未知重解析标记，跳过
             }
 
-            // 将 NT 路径格式转换为 Win32 路径
+            // 将 NT 路径格式转换为 Win32 路径。符号链接的重解析数据可以保存
+            // 相对目标；Windows 会以链接所在目录为基准解析，索引中也应保存同一
+            // 个完整路径，避免错误显示为“失效”以及复制出缺少前缀的路径。
             target = NtfsNative.NtToWin32Path(target);
+            target = ResolveTargetPath(path, target);
             var linkName = Path.GetFileName(path);
             var now = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
             string creationTime;
@@ -514,6 +520,25 @@ public class MftScannerService : IScannerService
         catch
         {
             return false;
+        }
+    }
+
+    /// <summary>将重解析点中的相对目标按链接所在目录解析为完整路径。</summary>
+    private static string ResolveTargetPath(string linkPath, string target)
+    {
+        if (string.IsNullOrWhiteSpace(target) || Path.IsPathRooted(target))
+            return target;
+
+        try
+        {
+            var linkDirectory = Path.GetDirectoryName(linkPath);
+            return string.IsNullOrEmpty(linkDirectory)
+                ? target
+                : Path.GetFullPath(Path.Combine(linkDirectory, target));
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return target;
         }
     }
 

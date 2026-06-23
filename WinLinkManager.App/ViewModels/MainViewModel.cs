@@ -299,14 +299,19 @@ public class MainViewModel : ViewModelBase
             var whitelistPaths = await _whitelistService.GetAllPathsAsync();
             var whitelistSet = new HashSet<string>(whitelistPaths, StringComparer.OrdinalIgnoreCase);
 
-            await foreach (var entry in _scannerService.FullScanAsync(scanDirs, progress, CancellationToken.None))
+            // MFT 枚举和重解析点分析是同步、CPU/I/O 密集型工作，必须离开 UI 线程。
+            await Task.Run(async () =>
             {
-                // 恢复白名单状态：若该路径在白名单中，标记 InWhitelist
-                if (whitelistSet.Contains(entry.LinkPath))
-                    entry.InWhitelist = true;
-                await _indexService.UpsertAsync(entry);
-                _uiContext.Post(_ => Links.Add(entry), null);
-            }
+                await foreach (var entry in _scannerService.FullScanAsync(
+                                   scanDirs, progress, CancellationToken.None))
+                {
+                    // 恢复白名单状态：若该路径在白名单中，标记 InWhitelist
+                    if (whitelistSet.Contains(entry.LinkPath))
+                        entry.InWhitelist = true;
+                    await _indexService.UpsertAsync(entry);
+                    _uiContext.Post(_ => Links.Add(entry), null);
+                }
+            });
             StatusMessage = $"扫描完成，共发现 {Links.Count} 个链接";
         }
         catch (Exception ex)
@@ -433,7 +438,15 @@ public class MainViewModel : ViewModelBase
             var result = _linkService.ConvertType(entry.LinkPath, entry.LinkType, newType, entry.TargetPath);
             if (result.Success)
             {
-                entry.LinkType = newType;
+                var actualType = _linkService.DetectType(entry.LinkPath);
+                if (actualType != newType)
+                {
+                    MessageBox.Show($"转换后类型校验失败：请求 {newType}，实际 {actualType}", "错误",
+                        MessageBoxButton.OK, MessageBoxImage.Error);
+                    return;
+                }
+
+                entry.LinkType = actualType;
                 await _indexService.UpsertAsync(entry);
                 _uiContext.Post(_ => LinksView.Refresh(), null);
                 StatusMessage = $"已转换: {entry.LinkName}";
